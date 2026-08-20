@@ -1,0 +1,317 @@
+// © QUANT RICK — ATR risk overlay and Pine v6 implementation
+// Research code: validate settings out-of-sample before live deployment.
+
+//@version=6
+strategy("TQQQ TEMACD — ATR Risk Overlay v6", overlay=true, pyramiding=0,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100.0,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CORE INPUTS — original TEMACD logic
+// ═════════════════════════════════════════════════════════════════════════════
+disp_ind = input.string("Equity", "Display", options=["Strategy", "Equity", "Open Profit", "Gross Profit", "Net Profit"])
+disp_col = input.color(color.blue, "Display Color")
+lvg      = input.float(1.0, "Leverage", minval=0.0, step=0.25)
+src      = input.source(close, "Source")
+
+maEngine = input.string("EMA (original Pine)", "MA engine", options=["EMA (original Pine)", "TEMA (repository challenger)"],
+     tooltip="EMA exactly preserves the supplied TradingView strategy. TEMA is an optional challenger inspired by the linked Python repository; validate it separately.")
+len_1 = input.int(5,   "First MA length",  minval=1, maxval=9999)
+len_2 = input.int(50,  "Second MA length", minval=1, maxval=9999)
+len_3 = input.int(222, "Third MA length",  minval=1, maxval=9999)
+
+fastLength = input.int(61, "MACD Fast Length", minval=1)
+slowLength = input.int(70, "MACD Slow Length", minval=2)
+macdLength = input.int(15, "MACD Signal Length", minval=1)
+
+tradeDirection = input.string("Long", "Trade Direction", options=["Long", "Short", "Both"])
+startDate = input.time(timestamp("01 Jan 2018 00:00"), "Start Date")
+endDate   = input.time(timestamp("31 Dec 2170 23:59"), "End Date")
+closeAtEnd = input.bool(true, "Close open position at End Date")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ATR RISK OVERLAY
+// The trend engine is unchanged. ATR only gates entries, manages exits and,
+// optionally, caps position risk.
+// ═════════════════════════════════════════════════════════════════════════════
+atrGroup = "ATR risk overlay"
+useAtrEntryFilter = input.bool(true, "Enable ATR entry filter", group=atrGroup)
+atrLength         = input.int(14, "ATR length", minval=2, group=atrGroup)
+atrBaselineLength = input.int(100, "ATR% baseline EMA", minval=20, group=atrGroup)
+atrEntryMaxRatio  = input.float(1.50, "Maximum ATR% / baseline for entry", minval=0.50, step=0.05, group=atrGroup,
+     tooltip="New positions are blocked when normalized ATR is this multiple above its trailing baseline.")
+atrMinPct         = input.float(0.0, "Minimum ATR % for entry", minval=0.0, step=0.1, group=atrGroup)
+atrMaxPct         = input.float(10.0, "Absolute maximum ATR % for entry", minval=0.1, step=0.1, group=atrGroup)
+
+useAtrShockExit   = input.bool(true, "Exit on extreme ATR shock", group=atrGroup)
+atrExitShockRatio = input.float(2.00, "ATR shock exit ratio", minval=1.0, step=0.05, group=atrGroup)
+
+useAtrStop        = input.bool(true, "Enable ratcheting ATR stop", group=atrGroup)
+atrStopMult       = input.float(3.0, "ATR stop multiple", minval=0.25, step=0.25, group=atrGroup)
+
+useAtrRiskSizing  = input.bool(false, "ATR risk-sized quantity", group=atrGroup,
+     tooltip="When enabled, quantity is capped so the initial ATR stop risks approximately Risk % of equity. The original equity/leverage quantity remains the hard maximum.")
+riskPct           = input.float(1.0, "Equity risk per position %", minval=0.05, maxval=10.0, step=0.05, group=atrGroup)
+
+showAtrStops      = input.bool(true, "Plot active ATR stop", group=atrGroup)
+showAtrRegime     = input.bool(true, "Highlight blocked ATR regime", group=atrGroup)
+
+// Metric annualization only; does not alter orders. Use 252 on daily US equity data.
+statsAnnualization = input.float(252.0, "Periods/year for Sharpe and Sortino", minval=1.0, group="Statistics")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ORIGINAL TEMACD CALCULATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+// Explicit TEMA implementation avoids reliance on optional Pine libraries.
+tema(float source, int length) =>
+    e1 = ta.ema(source, length)
+    e2 = ta.ema(e1, length)
+    e3 = ta.ema(e2, length)
+    3.0 * e1 - 3.0 * e2 + e3
+
+// Default EMA mode exactly preserves the supplied Pine strategy. Repository
+// TEMA is opt-in, so merely adding this code cannot alter the baseline.
+useTema = maEngine == "TEMA (repository challenger)"
+EMA1 = useTema ? tema(close, len_1) : ta.ema(close, len_1)
+EMA2 = useTema ? tema(close, len_2) : ta.ema(close, len_2)
+EMA3 = useTema ? tema(close, len_3) : ta.ema(close, len_3)
+
+MACD  = ta.ema(close, fastLength) - ta.ema(close, slowLength)
+aMACD = ta.ema(MACD, macdLength)
+delta = MACD - aMACD
+
+longCondition  = ta.crossover(delta, 0) or ta.crossover(EMA1, EMA2) or ta.crossover(EMA1, EMA3) or ta.crossover(EMA2, EMA3)
+shortCondition = ta.crossunder(delta, 0) or ta.crossunder(EMA1, EMA2) or ta.crossunder(EMA1, EMA3) or ta.crossunder(EMA2, EMA3)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ATR REGIME AND QUANTITY
+// ═════════════════════════════════════════════════════════════════════════════
+atrValue    = ta.atr(atrLength)
+atrPct      = close > 0 ? 100.0 * atrValue / close : na
+atrPctBase  = ta.ema(atrPct, atrBaselineLength)
+atrRatio    = atrPctBase > 0 ? atrPct / atrPctBase : na
+atrReady    = not na(atrValue) and not na(atrPctBase) and not na(atrRatio)
+atrEntryOK  = not useAtrEntryFilter or (atrReady and atrRatio <= atrEntryMaxRatio and atrPct >= atrMinPct and atrPct <= atrMaxPct)
+atrShock    = atrReady and atrRatio >= atrExitShockRatio
+
+// Original quantity: strategy.equity / source × leverage.
+baseQty = src > 0 ? math.max(strategy.equity, 0.0) / src * lvg : 0.0
+stopDistance = atrValue * atrStopMult
+riskCash     = math.max(strategy.equity, 0.0) * riskPct / 100.0
+riskQty      = stopDistance > syminfo.mintick ? riskCash / stopDistance : 0.0
+// Risk sizing is only valid when the corresponding protective stop is enabled.
+atrRiskSizingActive = useAtrRiskSizing and useAtrStop
+contracts    = atrRiskSizingActive ? math.min(baseQty, riskQty) : baseQty
+validQty     = not na(contracts) and contracts > 0
+
+inDateRange = time >= startDate and time < endDate
+longOK      = tradeDirection == "Long" or tradeDirection == "Both"
+shortOK     = tradeDirection == "Short" or tradeDirection == "Both"
+confirmed   = barstate.isconfirmed
+
+// ═════════════════════════════════════════════════════════════════════════════
+// RATCHETING ATR STOPS
+// Stops never loosen while a position remains open.
+// ═════════════════════════════════════════════════════════════════════════════
+var float highSinceEntry = na
+var float lowSinceEntry  = na
+var float longAtrStop    = na
+var float shortAtrStop   = na
+
+newLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if newLong
+    highSinceEntry := high
+    lowSinceEntry  := na
+    longAtrStop    := strategy.position_avg_price - atrStopMult * atrValue
+    shortAtrStop   := na
+else if strategy.position_size > 0
+    highSinceEntry := math.max(nz(highSinceEntry, high), high)
+    candidateLong  = highSinceEntry - atrStopMult * atrValue
+    longAtrStop    := math.max(nz(longAtrStop, candidateLong), candidateLong)
+else
+    highSinceEntry := na
+    longAtrStop    := na
+
+if newShort
+    lowSinceEntry  := low
+    highSinceEntry := na
+    shortAtrStop   := strategy.position_avg_price + atrStopMult * atrValue
+    longAtrStop    := na
+else if strategy.position_size < 0
+    lowSinceEntry  := math.min(nz(lowSinceEntry, low), low)
+    candidateShort = lowSinceEntry + atrStopMult * atrValue
+    shortAtrStop   := math.min(nz(shortAtrStop, candidateShort), candidateShort)
+else
+    lowSinceEntry := na
+    shortAtrStop  := na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ORDERS
+// Opposite TEMACD signals always close existing risk. ATR can block a new
+// reversal entry, but never blocks the original opposite-signal exit.
+// ═════════════════════════════════════════════════════════════════════════════
+if confirmed
+    // Emergency volatility exit takes priority and cannot re-enter on this bar.
+    if useAtrShockExit and atrShock
+        if strategy.position_size > 0
+            strategy.cancel("ATR exit long")
+            strategy.close("long", comment="ATR volatility shock")
+        if strategy.position_size < 0
+            strategy.cancel("ATR exit short")
+            strategy.close("short", comment="ATR volatility shock")
+
+    if not (useAtrShockExit and atrShock)
+        if longCondition
+            strategy.cancel("ATR exit short")
+            if longOK and inDateRange and atrEntryOK and validQty
+                // strategy.entry reverses an open short; pyramiding remains zero.
+                strategy.entry("long", strategy.long, qty=contracts, comment="TEMACD long + ATR OK")
+                // Attach protection to the pending entry; it is ratcheted from the actual fill afterwards.
+                if useAtrStop
+                    strategy.exit("ATR exit long", from_entry="long", stop=close - stopDistance, comment="Initial ATR stop")
+            else if strategy.position_size < 0
+                strategy.close("short", comment="TEMACD opposite signal")
+
+        if shortCondition
+            strategy.cancel("ATR exit long")
+            if shortOK and inDateRange and atrEntryOK and validQty
+                strategy.entry("short", strategy.short, qty=contracts, comment="TEMACD short + ATR OK")
+                if useAtrStop
+                    strategy.exit("ATR exit short", from_entry="short", stop=close + stopDistance, comment="Initial ATR stop")
+            else if strategy.position_size > 0
+                strategy.close("long", comment="TEMACD opposite signal")
+
+    // Protective stops remain active unless an opposite signal already closes/reverses.
+    noShockExit = not (useAtrShockExit and atrShock)
+    if useAtrStop and noShockExit and strategy.position_size > 0 and not shortCondition and not na(longAtrStop)
+        strategy.exit("ATR exit long", from_entry="long", stop=longAtrStop, comment="ATR trailing stop")
+    if useAtrStop and noShockExit and strategy.position_size < 0 and not longCondition and not na(shortAtrStop)
+        strategy.exit("ATR exit short", from_entry="short", stop=shortAtrStop, comment="ATR trailing stop")
+
+    // Deterministic end-of-window liquidation.
+    crossedEnd = time >= endDate and nz(time[1], time) < endDate
+    if closeAtEnd and crossedEnd
+        strategy.cancel_all()
+        strategy.close_all(comment="End date")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═════════════════════════════════════════════════════════════════════════════
+plot(EMA1, color=color.blue, linewidth=2, title="MA 1")
+plot(EMA2, color=color.white, linewidth=2, title="MA 2")
+plot(EMA3, color=color.orange, linewidth=2, title="MA 3")
+
+macdLinePlot   = plot(MACD, color=color.blue, linewidth=2, title="MACD Line", display=display.pane)
+signalLinePlot = plot(aMACD, color=color.orange, linewidth=2, title="Signal Line", display=display.pane)
+plot(delta, color=delta >= 0 ? color.new(color.lime, 50) : color.new(color.red, 50),
+     style=plot.style_histogram, linewidth=3, title="MACD Histogram", display=display.pane)
+fill(macdLinePlot, signalLinePlot, color=MACD >= aMACD ? color.new(color.green, 80) : color.new(color.red, 80), title="MACD Fill")
+
+plot(showAtrStops and strategy.position_size > 0 ? longAtrStop : na, "Long ATR stop", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(showAtrStops and strategy.position_size < 0 ? shortAtrStop : na, "Short ATR stop", color=color.aqua, linewidth=2, style=plot.style_linebr)
+bgcolor(showAtrRegime and not atrEntryOK ? color.new(color.red, 90) : na, title="ATR entry blocked")
+
+plot(disp_ind == "Equity" ? strategy.equity / strategy.initial_capital : na, color=disp_col, title="Strategy Equity")
+plot(disp_ind == "Open Profit" ? strategy.openprofit : na, color=disp_col, title="Open Profit")
+plot(disp_ind == "Gross Profit" ? strategy.grossprofit : na, color=disp_col, title="Gross Profit")
+plot(disp_ind == "Net Profit" ? strategy.netprofit : na, color=disp_col, title="Net Profit")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// NUMERIC HELPERS AND ONLINE PERFORMANCE STATISTICS
+// No unbounded return arrays: safe for long live histories.
+// ═════════════════════════════════════════════════════════════════════════════
+truncate(float number, int decimals) =>
+    factor = math.pow(10, decimals)
+    int(number * factor) / factor
+
+avgBarsPerTrade() =>
+    float result = na
+    if strategy.closedtrades > 0
+        int sumBars = 0
+        for i = 0 to strategy.closedtrades - 1
+            sumBars += strategy.closedtrades.exit_bar_index(i) - strategy.closedtrades.entry_bar_index(i) + 1
+        result := float(sumBars) / strategy.closedtrades
+    result
+
+var float maxEq = strategy.equity
+var float maxDd = 0.0
+maxEq := math.max(nz(maxEq[1], strategy.equity), strategy.equity)
+maxDd := math.min(nz(maxDd[1], 0.0), strategy.equity / maxEq - 1.0)
+
+barReturn = strategy.equity[1] > 0 ? strategy.equity / strategy.equity[1] - 1.0 : na
+var int nRet = 0
+var float meanRet = 0.0
+var float m2Ret = 0.0
+var float downsideSq = 0.0
+var float positiveArea = 0.0
+var float negativeArea = 0.0
+
+if time >= startDate and time < endDate and not na(barReturn)
+    nRet += 1
+    oldMean = meanRet
+    meanRet += (barReturn - meanRet) / nRet
+    m2Ret += (barReturn - oldMean) * (barReturn - meanRet)
+    downsideSq += math.pow(math.min(barReturn, 0.0), 2)
+    positiveArea += math.max(barReturn, 0.0)
+    negativeArea += math.abs(math.min(barReturn, 0.0))
+
+stdDev   = nRet > 1 ? math.sqrt(m2Ret / (nRet - 1)) : na
+downside = nRet > 0 ? math.sqrt(downsideSq / nRet) : na
+sharpe   = not na(stdDev) and stdDev > 0 ? meanRet / stdDev * math.sqrt(statsAnnualization) : na
+sortino  = not na(downside) and downside > 0 ? meanRet / downside * math.sqrt(statsAnnualization) : na
+omega    = negativeArea > 0 ? positiveArea / negativeArea : na
+
+trades = strategy.closedtrades
+avgBars = avgBarsPerTrade()
+profitablePct = trades > 0 ? strategy.wintrades / trades * 100.0 : na
+profitFactor  = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+maxDdDisplay  = maxDd * 100.0
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TABLES
+// ═════════════════════════════════════════════════════════════════════════════
+var table equityBox = table.new(position.top_center, 2, 1, bgcolor=color.new(color.black, 100))
+var table statsTable = table.new(position.middle_left, 2, 10, bgcolor=color.yellow, border_width=1)
+
+metricColor(float raw, float green, float red) =>
+    color result = color.yellow
+    if not na(raw)
+        result := raw >= green ? color.green : raw <= red ? color.red : color.yellow
+    result
+
+if barstate.islast
+    if disp_ind == "Equity"
+        table.cell(equityBox, 0, 0, "Equity", text_color=disp_col)
+        table.cell(equityBox, 1, 0, str.tostring(truncate(strategy.equity / strategy.initial_capital, 2)) + "x", text_color=disp_col)
+    else
+        table.clear(equityBox, 0, 0, 1, 0)
+
+    string[] labels = array.from("Max DD", "Sharpe", "Sortino", "Profit Factor", "Profitable %", "Trades", "AVG Bar", "ATR %", "ATR ratio", "ATR entry")
+    string[] values = array.from(
+         str.tostring(math.round(maxDdDisplay, 2)) + "%",
+         str.tostring(math.round(sharpe, 2)),
+         str.tostring(math.round(sortino, 2)),
+         str.tostring(math.round(profitFactor, 2)),
+         str.tostring(math.round(profitablePct, 2)) + "%",
+         str.tostring(trades),
+         str.tostring(math.round(avgBars)),
+         str.tostring(math.round(atrPct, 2)) + "%",
+         str.tostring(math.round(atrRatio, 2)) + "x",
+         atrEntryOK ? "OPEN" : "BLOCKED")
+    color[] colors = array.from(
+         maxDdDisplay >= -15 ? color.green : maxDdDisplay <= -35 ? color.red : color.yellow,
+         metricColor(sharpe, 1.75, 1.0),
+         metricColor(sortino, 2.0, 1.25),
+         metricColor(profitFactor, 3.0, 1.5),
+         metricColor(profitablePct, 55.0, 40.0),
+         trades >= 25 ? color.green : trades <= 10 ? color.red : color.yellow,
+         not na(avgBars) and avgBars >= 20 and avgBars <= 80 ? color.green : color.yellow,
+         color.yellow,
+         atrShock ? color.red : atrEntryOK ? color.green : color.yellow,
+         atrEntryOK ? color.green : color.red)
+
+    for i = 0 to array.size(labels) - 1
+        table.cell(statsTable, 0, i, array.get(labels, i), text_halign=text.align_left)
+        table.cell(statsTable, 1, i, array.get(values, i), text_halign=text.align_right, bgcolor=array.get(colors, i))

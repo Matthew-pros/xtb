@@ -1,0 +1,38 @@
+strategy:
+  # Slow, diversified trend speeds: no single optimised crossover.
+  ema_pairs: [[8, 32], [16, 64], [32, 128], [64, 256]]
+  target_vol: 0.40
+  vol_span_fast: 20
+  vol_span_slow: 120
+  # Rolling Gaussian-QMLE GARCH(1,1), refitted quarterly on trailing 2y only.
+  # Sizing uses max(EWMA vol, GARCH vol): GARCH may de-risk but never lever up.
+  garch_enabled: true
+  garch_window: 730
+  garch_min_obs: 365
+  garch_refit_days: 90
+  garch_vol_multiplier: 1.0
+  max_leverage: 1.25
+  max_jump_loss: 0.20
+  jump_sigma: 6.0
+  vol_shock_ratio: 1.75
+  vol_shock_multiplier: 0.50
+  drawdown_soft: 0.15
+  drawdown_hard: 0.30
+  drawdown_floor: 0.25
+  trade_buffer: 0.10
+execution:
+  fee_bps: 10.0
+  slippage_bps: 5.0
+  annual_funding: 0.06
+  annual_cash_rate: 0.0
+  periods_per_year: 365
+validation:
+  train_years: 4
+  test_years: 1
+  embargo_days: 7
+  bootstrap_samples: 2000
+  random_seed: 42
+  grid:
+    target_vol: [0.25, 0.35, 0.40, 0.50]
+    max_leverage: [1.0, 1.25, 1.5]
+    vol_shock_ratio: [1.5, 1.75, 2.0]
